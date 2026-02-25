@@ -8,6 +8,8 @@ from sqlalchemy import select
 from market_pipeline.db.session import get_session
 from market_pipeline.db.models import Candle1m
 
+from market_pipeline.marketdata.cleaning import clean_candles_df
+
 
 def export_1m_to_parquet(
     instrument_id: int,
@@ -50,12 +52,15 @@ def export_1m_to_parquet(
             rows = s.execute(stmt).all()
             if rows:
                 df = pd.DataFrame(rows, columns=["ts_utc", "bid_o", "bid_h", "bid_l", "bid_c", "bid_v"])
-                # Ensure UTC dtype
                 df["ts_utc"] = pd.to_datetime(df["ts_utc"], utc=True)
 
-                day_dir = base / f"day={d.isoformat()}"
-                day_dir.mkdir(parents=True, exist_ok=True)
-                df.to_parquet(day_dir / "data.parquet", index=False)
+                # CLEAN before caching
+                df, _clean = clean_candles_df(df)
+
+                if not df.empty:
+                    day_dir = base / f"day={d.isoformat()}"
+                    day_dir.mkdir(parents=True, exist_ok=True)
+                    df.to_parquet(day_dir / "data.parquet", index=False)
 
             d += timedelta(days=1)
 
