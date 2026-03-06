@@ -37,6 +37,15 @@ from market_pipeline.marketdata.cleaning import clean_candles_df
 
 from market_pipeline.marketdata.cleaning_reports import build_cleaning_report_range, build_validate_cleaning_cache_range
 
+from market_pipeline.strategy.ema_macd_atr_pullback import StrategyParams, prepare_features_and_signals
+from market_pipeline.backtest.engine import run_backtest, ExecutionParams, TrailingParams
+from market_pipeline.backtest.metrics import compute_metrics
+
+from pathlib import Path
+from market_pipeline.optimize.optuna_runner import run_optuna, save_optuna_result
+
+from market_pipeline.optimize.optuna_walkforward import run_optuna_walkforward, save_walkforward_result
+
 app = typer.Typer(help="Market pipeline CLI")
 
 
@@ -691,6 +700,273 @@ def validate_cleaning_cmd(date_from: str, date_to: str, timeframe: str = typer.A
     out_path.parent.mkdir(parents=True, exist_ok=True)
     df_days.to_parquet(out_path, index=False)
     typer.echo(f"Saved validation to: {out_path}")
+    
+@app.command("backtest-range")
+def backtest_range(
+    date_from: str,
+    date_to: str,
+    timeframe: str = typer.Argument("15min"),
+
+    ema_fast: int = typer.Option(20),
+    ema_trend: int = typer.Option(200),
+
+    rsi_period: int = typer.Option(14),
+    rsi_long_max: float = typer.Option(70.0),
+    rsi_short_min: float = typer.Option(30.0),
+
+    atr_period: int = typer.Option(14),
+    atr_sl_mult: float = typer.Option(2.0),
+    atr_tp_mult: float = typer.Option(3.0),
+
+    macd_fast: int = typer.Option(12),
+    macd_slow: int = typer.Option(26),
+    macd_signal: int = typer.Option(9),
+    macd_hist_threshold: float = typer.Option(0.0),
+
+    risk_per_trade: float = typer.Option(0.01),
+    initial_equity: float = typer.Option(10000.0),
+    max_leverage: float = typer.Option(20.0),
+
+    spread_pips: float = typer.Option(0.0),
+    commission_per_trade: float = typer.Option(0.0),
+
+    cooldown_bars: int = typer.Option(0),
+
+    trailing: bool = typer.Option(False),
+    atr_trail_start_mult: float = typer.Option(1.5),
+    atr_trail_mult: float = typer.Option(2.0),
+) -> None:
+    
+    #load candles, build indicators and signals, then run backtest, then print metrics.
+    settings = get_settings()
+    d0 = date.fromisoformat(date_from)
+    d1 = date.fromisoformat(date_to)
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    #load candles as float prices
+    candles = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=d0,
+        d1=d1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+
+    if candles.empty:
+        typer.echo("No candle data for this range/timeframe.")
+        raise typer.Exit(code=1)
+
+    #strategy params
+    sp = StrategyParams(
+        ema_fast=ema_fast,
+        ema_trend=ema_trend,
+        rsi_period=rsi_period,
+        rsi_long_max=rsi_long_max,
+        rsi_short_min=rsi_short_min,
+        atr_period=atr_period,
+        atr_sl_mult=atr_sl_mult,
+        atr_tp_mult=atr_tp_mult,
+        macd_fast=macd_fast,
+        macd_slow=macd_slow,
+        macd_signal=macd_signal,
+        macd_hist_threshold=macd_hist_threshold,
+        cooldown_bars=cooldown_bars,
+    )
+
+    df = prepare_features_and_signals(candles, sp)
+
+    atr_col = f"atr_{atr_period}"
+
+    result = run_backtest(
+        df,
+        atr_col=atr_col,
+        sl_atr_mult=atr_sl_mult,
+        tp_atr_mult=atr_tp_mult,
+        cooldown_bars=cooldown_bars,
+        exec_params=ExecutionParams(
+            initial_equity=initial_equity,
+            risk_per_trade=risk_per_trade,
+            max_leverage=max_leverage,
+            spread_pips=spread_pips,
+            commission_per_trade=commission_per_trade,
+        ),
+        trailing=TrailingParams(
+            enabled=trailing,
+            atr_trail_start_mult=atr_trail_start_mult,
+            atr_trail_mult=atr_trail_mult,
+        ),
+    )
+
+    m = compute_metrics(result)
+
+    typer.echo(f"Symbol: {settings.symbol}")
+    typer.echo(f"Timeframe: {timeframe} Range: [{d0}, {d1})")
+    typer.echo(f"Trades: {m.trades}")
+    typer.echo(f"Total return: {m.total_return_pct:.2f}%")
+    typer.echo(f"Max drawdown: {m.max_drawdown_pct:.2f}%")
+    typer.echo(f"Sharpe (per-bar): {m.sharpe:.3f}")
+    typer.echo(f"Winrate: {m.winrate_pct:.1f}%")
+    typer.echo(f"Profit factor: {m.profit_factor:.2f}")
+    
+@app.command("optuna-run")
+def optuna_run(
+    date_from: str,
+    date_to: str,
+    timeframe: str = typer.Argument("15min"),
+    train_end: str = typer.Option(..., help="Train end date YYYY-MM-DD. Test will be [train_end, date_to)."),
+    trials: int = typer.Option(200),
+    n_jobs: int = typer.Option(4),
+    seed: int = typer.Option(42),
+    study_name: str = typer.Option("eurusd_study_v1"),
+    spread_pips: float = typer.Option(0.8),
+    commission_per_trade: float = typer.Option(0.0),
+    risk_per_trade: float = typer.Option(0.01),
+    initial_equity: float = typer.Option(10000.0),
+    max_leverage: float = typer.Option(20.0),
+    trailing_allowed: bool = typer.Option(True),
+) -> None:
+
+    #Run optuna optimization on train range and evaluate the best params on test range
+    
+    settings = get_settings()
+    d0 = date.fromisoformat(date_from)
+    d1 = date.fromisoformat(date_to)
+    d_train_end = date.fromisoformat(train_end)
+
+    if not (d0 < d_train_end < d1):
+        raise typer.BadParameter("train_end must be strictly inside (date_from, date_to)")
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    #load candles once
+    candles_train = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=d0,
+        d1=d_train_end,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+    candles_test = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=d_train_end,
+        d1=d1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+
+    if candles_train.empty or candles_test.empty:
+        typer.echo("Train or test candles are empty. Make sure data exists and timeframe cache is built.")
+        raise typer.Exit(code=1)
+
+    storage_path = Path(settings.parquet_cache_dir) / "optuna" / "studies.db"
+    result = run_optuna(
+        candles_train=candles_train,
+        candles_test=candles_test,
+        timeframe=timeframe,
+        trials=trials,
+        n_jobs=n_jobs,
+        study_name=study_name,
+        storage_path=storage_path,
+        seed=seed,
+        spread_pips=spread_pips,
+        commission_per_trade=commission_per_trade,
+        risk_per_trade=risk_per_trade,
+        initial_equity=initial_equity,
+        max_leverage=max_leverage,
+        trailing_allowed=trailing_allowed,
+    )
+
+    out_path = Path(settings.parquet_cache_dir) / "optuna" / f"{study_name}_{date_from}_{date_to}_{timeframe}.json"
+    save_optuna_result(result, out_path)
+
+    typer.echo(f"Study: {result['study_name']}")
+    typer.echo(f"Best value (score): {result['best_value']:.6f}")
+    typer.echo(f"Best params: {result['best_params']}")
+    typer.echo(f"Train metrics: {result['train_metrics']}")
+    typer.echo(f"Test metrics:  {result['test_metrics']}")
+    typer.echo(f"Saved result to: {out_path}")
+    
+@app.command("optuna-walkforward")
+def optuna_walkforward_cmd(
+    date_from: str,
+    date_to: str,
+    timeframe: str = typer.Argument("15min"),
+    train_months: int = typer.Option(6),
+    test_months: int = typer.Option(2),
+    warmup_bars: int = typer.Option(400),
+    trials: int = typer.Option(300),
+    n_jobs: int = typer.Option(4),
+    seed: int = typer.Option(42),
+    study_name: str = typer.Option("eurusd15m_wf_v1"),
+    spread_pips: float = typer.Option(0.8),
+    commission_per_trade: float = typer.Option(0.0),
+    risk_per_trade: float = typer.Option(0.01),
+    initial_equity: float = typer.Option(10000.0),
+    max_leverage: float = typer.Option(1000.0),  #no leverage constraint
+    trailing_allowed: bool = typer.Option(True),
+    save_best_artifacts: bool = typer.Option(True),
+) -> None:
+    settings = get_settings()
+    d0 = date.fromisoformat(date_from)
+    d1 = date.fromisoformat(date_to)
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    #load candles once (15min will load from cache)
+    candles_all = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=d0,
+        d1=d1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+    if candles_all.empty:
+        typer.echo("No candles loaded. Make sure 15min cache exists for the full range.")
+        raise typer.Exit(code=1)
+
+    out_dir = settings.parquet_cache_dir / "optuna_walkforward"
+    result = run_optuna_walkforward(
+        candles_all=candles_all,
+        date_from=d0,
+        date_to=d1,
+        timeframe=timeframe,
+        train_months=train_months,
+        test_months=test_months,
+        trials=trials,
+        n_jobs=n_jobs,
+        seed=seed,
+        study_name=study_name,
+        spread_pips=spread_pips,
+        commission_per_trade=commission_per_trade,
+        risk_per_trade=risk_per_trade,
+        initial_equity=initial_equity,
+        max_leverage=max_leverage,
+        trailing_allowed=trailing_allowed,
+        warmup_bars=warmup_bars,
+        out_dir=out_dir,
+        save_best_artifacts=save_best_artifacts,
+    )
+
+    out_path = out_dir / f"{study_name}_{date_from}_{date_to}_{timeframe}.json"
+    save_walkforward_result(result, out_path)
+
+    typer.echo(f"Saved walk-forward result to: {out_path}")
+    typer.echo(f"Best value: {result['best_value']:.6f}")
+    typer.echo(f"Best params: {result['best_params']}")
+    typer.echo(f"Folds: {result['folds']}")
 
 def main() -> None:
     app()
