@@ -7,6 +7,8 @@ from sqlalchemy import inspect, text
 from market_pipeline.config import get_settings
 from market_pipeline.db.session import engine
 
+import pandas as pd
+
 from datetime import date, datetime, timezone
 import asyncio
 
@@ -45,6 +47,10 @@ from pathlib import Path
 from market_pipeline.optimize.optuna_runner import run_optuna, save_optuna_result
 
 from market_pipeline.optimize.optuna_walkforward import run_optuna_walkforward, save_walkforward_result
+
+from market_pipeline.optimize.splits import walkforward_splits
+from market_pipeline.montecarlo.garch_fold_mc import build_garch_fold_context, generate_synthetic_test_candles
+from market_pipeline.montecarlo.validation import save_real_vs_synthetic_validation
 
 app = typer.Typer(help="Market pipeline CLI")
 
@@ -842,7 +848,6 @@ def optuna_run(
 
     instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
 
-    #load candles once
     candles_train = load_range(
         instrument_id=instrument_id,
         symbol=settings.symbol,
@@ -904,16 +909,30 @@ def optuna_walkforward_cmd(
     train_months: int = typer.Option(6),
     test_months: int = typer.Option(2),
     warmup_bars: int = typer.Option(400),
-    trials: int = typer.Option(300),
-    n_jobs: int = typer.Option(4),
+    trials: int = typer.Option(100),
+    n_jobs: int = typer.Option(1),
     seed: int = typer.Option(42),
-    study_name: str = typer.Option("eurusd15m_wf_v1"),
+    study_name: str = typer.Option("eurusd15m_wf_mc_v1"),
     spread_pips: float = typer.Option(0.8),
     commission_per_trade: float = typer.Option(0.0),
     risk_per_trade: float = typer.Option(0.01),
     initial_equity: float = typer.Option(10000.0),
-    max_leverage: float = typer.Option(1000.0),  #no leverage constraint
+    max_leverage: float = typer.Option(1000.0),
     trailing_allowed: bool = typer.Option(True),
+
+    mc_simulations: int = typer.Option(30),
+    hist_weight: float = typer.Option(0.7),
+    mc_weight: float = typer.Option(0.3),
+
+    garch_dist: str = typer.Option("t"),
+    garch_p: int = typer.Option(1),
+    garch_q: int = typer.Option(1),
+    garch_burn: int = typer.Option(500),
+
+    demean_returns: bool = typer.Option(True),
+    return_vol_scale: float = typer.Option(0.8),
+    wick_vol_scale: float = typer.Option(0.75),
+
     save_best_artifacts: bool = typer.Option(True),
 ) -> None:
     settings = get_settings()
@@ -922,7 +941,6 @@ def optuna_walkforward_cmd(
 
     instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
 
-    #load candles once (15min will load from cache)
     candles_all = load_range(
         instrument_id=instrument_id,
         symbol=settings.symbol,
@@ -934,10 +952,11 @@ def optuna_walkforward_cmd(
         as_float_prices=True,
     )
     if candles_all.empty:
-        typer.echo("No candles loaded. Make sure 15min cache exists for the full range.")
+        typer.echo("No candles loaded. Make sure timeframe cache exists for the full range.")
         raise typer.Exit(code=1)
 
-    out_dir = settings.parquet_cache_dir / "optuna_walkforward"
+    out_dir = settings.parquet_cache_dir / "optuna_walkforward_mc"
+
     result = run_optuna_walkforward(
         candles_all=candles_all,
         date_from=d0,
@@ -956,6 +975,16 @@ def optuna_walkforward_cmd(
         max_leverage=max_leverage,
         trailing_allowed=trailing_allowed,
         warmup_bars=warmup_bars,
+        mc_simulations=mc_simulations,
+        hist_weight=hist_weight,
+        mc_weight=mc_weight,
+        garch_dist=garch_dist,
+        garch_p=garch_p,
+        garch_q=garch_q,
+        garch_burn=garch_burn,
+        demean_returns=demean_returns,
+        return_vol_scale=return_vol_scale,
+        wick_vol_scale=wick_vol_scale,
         out_dir=out_dir,
         save_best_artifacts=save_best_artifacts,
     )
@@ -963,10 +992,122 @@ def optuna_walkforward_cmd(
     out_path = out_dir / f"{study_name}_{date_from}_{date_to}_{timeframe}.json"
     save_walkforward_result(result, out_path)
 
-    typer.echo(f"Saved walk-forward result to: {out_path}")
+    typer.echo(f"Saved walk-forward MC result to: {out_path}")
     typer.echo(f"Best value: {result['best_value']:.6f}")
     typer.echo(f"Best params: {result['best_params']}")
     typer.echo(f"Folds: {result['folds']}")
+    typer.echo(f"MC simulations per fold: {result['mc_simulations_per_fold']}")
+
+
+@app.command("validate-mc-ohlc")
+def validate_mc_ohlc_cmd(
+    date_from: str,
+    date_to: str,
+    timeframe: str = typer.Argument("15min"),
+    fold_index: int = typer.Option(1, help="1-based fold index"),
+    train_months: int = typer.Option(6),
+    test_months: int = typer.Option(2),
+    warmup_bars: int = typer.Option(400),
+    seed: int = typer.Option(42),
+    bars_to_plot: int = typer.Option(200),
+    garch_dist: str = typer.Option("t"),
+    garch_p: int = typer.Option(1),
+    garch_q: int = typer.Option(1),
+    garch_burn: int = typer.Option(500),
+    demean_returns: bool = typer.Option(True),
+    return_vol_scale: float = typer.Option(0.8),
+    wick_vol_scale: float = typer.Option(0.75),
+) -> None:
+    settings = get_settings()
+    d0 = date.fromisoformat(date_from)
+    d1 = date.fromisoformat(date_to)
+
+    folds = walkforward_splits(d0, d1, train_months, test_months)
+    if not folds:
+        typer.echo("No folds available for this range/train/test setup.")
+        raise typer.Exit(code=1)
+
+    if fold_index < 1 or fold_index > len(folds):
+        typer.echo(f"fold_index must be between 1 and {len(folds)}")
+        raise typer.Exit(code=1)
+
+    fold = folds[fold_index - 1]
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    candles_all = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=d0,
+        d1=d1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+
+    if candles_all.empty:
+        typer.echo("No candles loaded for this range/timeframe.")
+        raise typer.Exit(code=1)
+
+    candles_all = candles_all.sort_values("ts_utc").reset_index(drop=True)
+    candles_all["ts_utc"] = pd.to_datetime(candles_all["ts_utc"], utc=True)
+
+    train_start_ts = pd.Timestamp(fold.train_start, tz="UTC")
+    train_end_ts = pd.Timestamp(fold.train_end, tz="UTC")
+    test_start_ts = pd.Timestamp(fold.test_start, tz="UTC")
+    test_end_ts = pd.Timestamp(fold.test_end, tz="UTC")
+
+    train_candles = candles_all[(candles_all["ts_utc"] >= train_start_ts) & (candles_all["ts_utc"] < train_end_ts)].copy()
+    test_candles = candles_all[(candles_all["ts_utc"] >= test_start_ts) & (candles_all["ts_utc"] < test_end_ts)].copy()
+
+    if train_candles.empty or test_candles.empty:
+        typer.echo("Train or test candles are empty for the selected fold.")
+        raise typer.Exit(code=1)
+
+    context = build_garch_fold_context(
+        train_candles=train_candles,
+        test_candles=test_candles,
+        train_start=fold.train_start,
+        train_end=fold.train_end,
+        test_start=fold.test_start,
+        test_end=fold.test_end,
+        warmup_bars=warmup_bars,
+        burn=garch_burn,
+        p=garch_p,
+        q=garch_q,
+        dist=garch_dist,
+        demean_returns=demean_returns,
+        return_vol_scale=return_vol_scale,
+        wick_vol_scale=wick_vol_scale,
+    )
+
+    synthetic_full = generate_synthetic_test_candles(context, seed=seed)
+    synthetic_test = synthetic_full.iloc[len(context.warmup_tail):].copy().reset_index(drop=True)
+
+    out_dir = (
+        settings.parquet_cache_dir
+        / "mc_validation"
+        / f"symbol={settings.symbol}"
+        / f"timeframe={timeframe}"
+        / f"fold={fold_index:02d}_{fold.test_start}_{fold.test_end}"
+    )
+
+    artifacts = save_real_vs_synthetic_validation(
+        real_test_candles=test_candles,
+        synthetic_test_candles=synthetic_test,
+        out_dir=out_dir,
+        seed=seed,
+        bars_to_plot=bars_to_plot,
+        prefix=f"mc_validation_fold_{fold_index:02d}",
+    )
+
+    typer.echo(f"Fold {fold_index}: train=[{fold.train_start}, {fold.train_end}) test=[{fold.test_start}, {fold.test_end})")
+    typer.echo(f"Saved summary JSON: {artifacts.summary_json}")
+    typer.echo(f"Saved candlestick chart: {artifacts.chart_png}")
+    typer.echo(f"Saved real candles: {artifacts.real_parquet}")
+    typer.echo(f"Saved synthetic candles: {artifacts.synthetic_parquet}")
+
 
 def main() -> None:
     app()
