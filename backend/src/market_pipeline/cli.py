@@ -52,6 +52,10 @@ from market_pipeline.optimize.splits import walkforward_splits
 from market_pipeline.montecarlo.garch_fold_mc import build_garch_fold_context, generate_synthetic_test_candles
 from market_pipeline.montecarlo.validation import save_real_vs_synthetic_validation
 
+from pathlib import Path
+from market_pipeline.optimize.development_region import discover_parameter_region, save_development_region
+from market_pipeline.optimize.final_holdout_region import evaluate_region_on_holdout, save_holdout_region_result
+
 app = typer.Typer(help="Market pipeline CLI")
 
 
@@ -1107,6 +1111,173 @@ def validate_mc_ohlc_cmd(
     typer.echo(f"Saved candlestick chart: {artifacts.chart_png}")
     typer.echo(f"Saved real candles: {artifacts.real_parquet}")
     typer.echo(f"Saved synthetic candles: {artifacts.synthetic_parquet}")
+
+@app.command("discover-parameter-region")
+def discover_parameter_region_cmd(
+    development_from: str,
+    development_to: str,
+    timeframe: str = typer.Argument("15min"),
+    train_months: int = typer.Option(6),
+    test_months: int = typer.Option(2),
+    inner_trials_per_fold: int = typer.Option(60),
+    top_candidates_per_fold: int = typer.Option(5),
+    nearby_variants: int = typer.Option(20),
+    seed: int = typer.Option(42),
+    trailing_allowed: bool = typer.Option(True),
+    spread_pips: float = typer.Option(0.8),
+    commission_per_trade: float = typer.Option(0.0),
+    risk_per_trade: float = typer.Option(0.01),
+    initial_equity: float = typer.Option(10000.0),
+    max_leverage: float = typer.Option(1000.0),
+    warmup_bars: int = typer.Option(400),
+    mc_simulations: int = typer.Option(30),
+    hist_weight: float = typer.Option(0.7),
+    mc_weight: float = typer.Option(0.3),
+    garch_dist: str = typer.Option("t"),
+    garch_p: int = typer.Option(1),
+    garch_q: int = typer.Option(1),
+    garch_burn: int = typer.Option(500),
+    demean_returns: bool = typer.Option(True),
+    return_vol_scale: float = typer.Option(0.8),
+    wick_vol_scale: float = typer.Option(0.75),
+    fold_workers: int = typer.Option(3),
+    inner_optuna_jobs: int = typer.Option(1),
+    region_workers: int = typer.Option(3),
+) -> None:
+    settings = get_settings()
+    d0 = date.fromisoformat(development_from)
+    d1 = date.fromisoformat(development_to)
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    candles_all = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=d0,
+        d1=d1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+    if candles_all.empty:
+        typer.echo("No candles loaded for development period.")
+        raise typer.Exit(code=1)
+
+    result = discover_parameter_region(
+        candles_all=candles_all,
+        development_from=d0,
+        development_to=d1,
+        timeframe=timeframe,
+        train_months=train_months,
+        test_months=test_months,
+        inner_trials_per_fold=inner_trials_per_fold,
+        top_candidates_per_fold=top_candidates_per_fold,
+        nearby_variants=nearby_variants,
+        seed=seed,
+        trailing_allowed=trailing_allowed,
+        spread_pips=spread_pips,
+        commission_per_trade=commission_per_trade,
+        risk_per_trade=risk_per_trade,
+        initial_equity=initial_equity,
+        max_leverage=max_leverage,
+        warmup_bars=warmup_bars,
+        mc_simulations=mc_simulations,
+        hist_weight=hist_weight,
+        mc_weight=mc_weight,
+        garch_dist=garch_dist,
+        garch_p=garch_p,
+        garch_q=garch_q,
+        garch_burn=garch_burn,
+        demean_returns=demean_returns,
+        return_vol_scale=return_vol_scale,
+        wick_vol_scale=wick_vol_scale,
+        fold_workers=fold_workers,
+        inner_optuna_jobs=inner_optuna_jobs,
+        region_workers=region_workers,
+    )
+
+    out_dir = settings.parquet_cache_dir / "parameter_region"
+    out_path = out_dir / f"region_{development_from}_{development_to}_{timeframe}.json"
+    save_development_region(result, out_path)
+
+    typer.echo(f"Saved parameter region to: {out_path}")
+    typer.echo(f"Folds: {len(result['fold_summaries'])}")
+    typer.echo(f"Nearby variants: {len(result['robust_region']['nearby_variants'])}")
+
+@app.command("evaluate-parameter-region-holdout")
+def evaluate_parameter_region_holdout_cmd(
+    region_json_path: str,
+    development_from: str,
+    development_to: str,
+    holdout_from: str,
+    holdout_to: str,
+    timeframe: str = typer.Argument("15min"),
+    spread_pips: float = typer.Option(0.8),
+    commission_per_trade: float = typer.Option(0.0),
+    risk_per_trade: float = typer.Option(0.01),
+    initial_equity: float = typer.Option(10000.0),
+    max_leverage: float = typer.Option(1000.0),
+    warmup_bars: int = typer.Option(400),
+    mc_simulations: int = typer.Option(300),
+    hist_weight: float = typer.Option(0.7),
+    mc_weight: float = typer.Option(0.3),
+    save_top_artifacts: int = typer.Option(3),
+    holdout_workers: int = typer.Option(3),
+) -> None:
+    settings = get_settings()
+
+    dev0 = date.fromisoformat(development_from)
+    dev1 = date.fromisoformat(development_to)
+    hold0 = date.fromisoformat(holdout_from)
+    hold1 = date.fromisoformat(holdout_to)
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    candles_all = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=dev0,
+        d1=hold1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+    if candles_all.empty:
+        typer.echo("No candles loaded.")
+        raise typer.Exit(code=1)
+
+    out_dir = settings.parquet_cache_dir / "holdout_region_eval"
+
+    result = evaluate_region_on_holdout(
+        candles_all=candles_all,
+        development_from=dev0,
+        development_to=dev1,
+        holdout_from=hold0,
+        holdout_to=hold1,
+        timeframe=timeframe,
+        region_json_path=Path(region_json_path),
+        spread_pips=spread_pips,
+        commission_per_trade=commission_per_trade,
+        risk_per_trade=risk_per_trade,
+        initial_equity=initial_equity,
+        max_leverage=max_leverage,
+        warmup_bars=warmup_bars,
+        mc_simulations=mc_simulations,
+        hist_weight=hist_weight,
+        mc_weight=mc_weight,
+        save_top_artifacts=save_top_artifacts,
+        out_dir=out_dir,
+        holdout_workers=holdout_workers,
+    )
+
+    out_path = out_dir / f"holdout_region_{holdout_from}_{holdout_to}_{timeframe}.json"
+    save_holdout_region_result(result, out_path)
+
+    typer.echo(f"Saved holdout region evaluation to: {out_path}")
+    typer.echo(f"Region size: {result['region_size']}")
+    typer.echo(f"Median holdout combined score: {result['region_group_summary']['median_holdout_combined_score']:.6f}")
 
 
 def main() -> None:
