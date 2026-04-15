@@ -56,6 +56,15 @@ from pathlib import Path
 from market_pipeline.optimize.development_region import discover_parameter_region, save_development_region
 from market_pipeline.optimize.final_holdout_region import evaluate_region_on_holdout, save_holdout_region_result
 
+from market_pipeline.optimize.optuna_walkforward_pareto import (
+    run_optuna_walkforward_pareto,
+    save_walkforward_pareto_result,
+    evaluate_selected_best_on_holdout,
+    save_holdout_result,
+)
+
+from market_pipeline.reporting.pareto_report import build_pareto_report
+
 app = typer.Typer(help="Market pipeline CLI")
 
 
@@ -1279,6 +1288,181 @@ def evaluate_parameter_region_holdout_cmd(
     typer.echo(f"Region size: {result['region_size']}")
     typer.echo(f"Median holdout combined score: {result['region_group_summary']['median_holdout_combined_score']:.6f}")
 
+@app.command("optuna-walkforward-pareto")
+def optuna_walkforward_pareto_cmd(
+    date_from: str,
+    date_to: str,
+    timeframe: str = typer.Argument("15min"),
+    train_months: int = typer.Option(6),
+    test_months: int = typer.Option(2),
+    trials: int = typer.Option(40),
+    n_jobs: int = typer.Option(2),
+    seed: int = typer.Option(42),
+    study_name: str = typer.Option("eurusd15m_wf_pareto_v1"),
+    spread_pips: float = typer.Option(0.8),
+    commission_per_trade: float = typer.Option(0.0),
+    risk_per_trade: float = typer.Option(0.01),
+    initial_equity: float = typer.Option(10000.0),
+    max_leverage: float = typer.Option(100.0),
+    trailing_allowed: bool = typer.Option(True),
+    warmup_bars: int = typer.Option(400),
+    mc_simulations: int = typer.Option(30),
+    garch_dist: str = typer.Option("t"),
+    garch_p: int = typer.Option(1),
+    garch_q: int = typer.Option(1),
+    garch_burn: int = typer.Option(500),
+    demean_returns: bool = typer.Option(True),
+    return_vol_scale: float = typer.Option(0.8),
+    wick_vol_scale: float = typer.Option(0.75),
+    max_folds: int = typer.Option(10),
+    overfit_penalty_lambda: float = typer.Option(0.25),
+    pareto_select_oos_weight: float = typer.Option(0.7),
+    pareto_select_mc_weight: float = typer.Option(0.3),
+) -> None:
+    settings = get_settings()
+    d0 = date.fromisoformat(date_from)
+    d1 = date.fromisoformat(date_to)
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    candles_all = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=d0,
+        d1=d1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+    if candles_all.empty:
+        typer.echo("No candles loaded.")
+        raise typer.Exit(code=1)
+
+    out_dir = settings.parquet_cache_dir / "optuna_walkforward_pareto"
+
+    result = run_optuna_walkforward_pareto(
+        candles_all=candles_all,
+        date_from=d0,
+        date_to=d1,
+        timeframe=timeframe,
+        train_months=train_months,
+        test_months=test_months,
+        trials=trials,
+        n_jobs=n_jobs,
+        seed=seed,
+        study_name=study_name,
+        spread_pips=spread_pips,
+        commission_per_trade=commission_per_trade,
+        risk_per_trade=risk_per_trade,
+        initial_equity=initial_equity,
+        max_leverage=max_leverage,
+        trailing_allowed=trailing_allowed,
+        warmup_bars=warmup_bars,
+        mc_simulations=mc_simulations,
+        garch_dist=garch_dist,
+        garch_p=garch_p,
+        garch_q=garch_q,
+        garch_burn=garch_burn,
+        demean_returns=demean_returns,
+        return_vol_scale=return_vol_scale,
+        wick_vol_scale=wick_vol_scale,
+        max_folds=max_folds,
+        overfit_penalty_lambda=overfit_penalty_lambda,
+        pareto_select_oos_weight=pareto_select_oos_weight,
+        pareto_select_mc_weight=pareto_select_mc_weight,
+        out_dir=out_dir,
+    )
+
+    out_path = out_dir / f"{study_name}_{date_from}_{date_to}_{timeframe}.json"
+    save_walkforward_pareto_result(result, out_path)
+
+    typer.echo(f"Saved Pareto walk-forward result to: {out_path}")
+    typer.echo(f"Pareto front size: {len(result['pareto_front'])}")
+    typer.echo(f"Selected best selection score: {result['selected_best']['selection_score']:.6f}")
+    typer.echo(f"Selected best params: {result['selected_best']['params']}")
+
+@app.command("evaluate-pareto-holdout")
+def evaluate_pareto_holdout_cmd(
+    result_json_path: str,
+    development_from: str,
+    development_to: str,
+    holdout_from: str,
+    holdout_to: str,
+    timeframe: str = typer.Argument("15min"),
+    spread_pips: float = typer.Option(0.8),
+    commission_per_trade: float = typer.Option(0.0),
+    risk_per_trade: float = typer.Option(0.01),
+    initial_equity: float = typer.Option(10000.0),
+    max_leverage: float = typer.Option(100.0),
+    warmup_bars: int = typer.Option(400),
+    holdout_mc_simulations: int = typer.Option(300),
+    save_artifacts: bool = typer.Option(True),
+) -> None:
+    settings = get_settings()
+
+    dev0 = date.fromisoformat(development_from)
+    dev1 = date.fromisoformat(development_to)
+    hold0 = date.fromisoformat(holdout_from)
+    hold1 = date.fromisoformat(holdout_to)
+
+    instrument_id = ensure_instrument(settings.symbol, settings.price_scale)
+
+    candles_all = load_range(
+        instrument_id=instrument_id,
+        symbol=settings.symbol,
+        timeframe=timeframe,
+        d0=dev0,
+        d1=hold1,
+        parquet_cache_dir=settings.parquet_cache_dir,
+        price_scale=settings.price_scale,
+        as_float_prices=True,
+    )
+    if candles_all.empty:
+        typer.echo("No candles loaded.")
+        raise typer.Exit(code=1)
+
+    out_dir = settings.parquet_cache_dir / "pareto_holdout_eval"
+
+    result = evaluate_selected_best_on_holdout(
+        candles_all=candles_all,
+        result_json_path=Path(result_json_path),
+        development_from=dev0,
+        development_to=dev1,
+        holdout_from=hold0,
+        holdout_to=hold1,
+        timeframe=timeframe,
+        spread_pips=spread_pips,
+        commission_per_trade=commission_per_trade,
+        risk_per_trade=risk_per_trade,
+        initial_equity=initial_equity,
+        max_leverage=max_leverage,
+        warmup_bars=warmup_bars,
+        holdout_mc_simulations=holdout_mc_simulations,
+        save_artifacts=save_artifacts,
+        out_dir=out_dir,
+    )
+
+    out_path = out_dir / f"pareto_holdout_{holdout_from}_{holdout_to}_{timeframe}.json"
+    save_holdout_result(result, out_path)
+
+    typer.echo(f"Saved holdout evaluation to: {out_path}")
+    typer.echo(f"Final selection score: {result['final_selection_score']:.6f}")
+    typer.echo(f"Historical holdout score: {result['historical_holdout_score']:.6f}")
+    typer.echo(f"Holdout MC score: {result['holdout_mc_score']:.6f}")
+
+@app.command("build-pareto-report")
+def build_pareto_report_cmd(
+    pareto_result_json: str,
+    holdout_result_json: str,
+    output_pdf: str = typer.Option("pareto_final_report.pdf"),
+) -> None:
+    out_path = build_pareto_report(
+        pareto_result_json=Path(pareto_result_json),
+        holdout_result_json=Path(holdout_result_json),
+        output_pdf=Path(output_pdf),
+    )
+    typer.echo(f"Saved PDF report to: {out_path}")
 
 def main() -> None:
     app()

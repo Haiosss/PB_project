@@ -53,6 +53,8 @@ class GarchFoldContext:
     return_vol_scale: float
     wick_vol_scale: float
 
+    anchor_price: float
+
 
 def _safe_clip_series(s: pd.Series, q_low: float = 0.01, q_high: float = 0.99) -> pd.Series:
     if s.empty:
@@ -182,6 +184,8 @@ def build_garch_fold_context(
         bar_delta = test_ts.iloc[1] - test_ts.iloc[0]
     else:
         bar_delta = pd.Timedelta(minutes=15)
+        
+    anchor_price = float(train_candles["bid_c"].iloc[-1])
 
     return GarchFoldContext(
         train_start=train_start,
@@ -206,6 +210,7 @@ def build_garch_fold_context(
         demean_returns=demean_returns,
         return_vol_scale=return_vol_scale,
         wick_vol_scale=wick_vol_scale,
+        anchor_price=anchor_price,
     )
 
 
@@ -262,7 +267,7 @@ def generate_synthetic_test_candles(context: GarchFoldContext, seed: int) -> pd.
     sim_sigma = sim_sigma * context.return_vol_scale
 
     rng = np.random.default_rng(seed + 12345)
-    prev_close = float(context.warmup_tail["bid_c"].iloc[-1])
+    prev_close = float(context.anchor_price)
 
     rows = []
 
@@ -329,30 +334,35 @@ def mc_summary_to_score(summary: dict) -> float:
 
 def evaluate_fold_monte_carlo(
     *,
-    context: GarchFoldContext,
-    strategy_params: StrategyParams,
-    exec_params: ExecutionParams,
-    trailing: TrailingParams,
-    simulations: int = 30,
-    seed: int = 42,
+    context,
+    strategy_params,
+    exec_params,
+    trailing,
+    simulations: int,
+    seed: int,
+    return_details: bool = False,
 ) -> dict:
-    metrics_rows = []
+    import numpy as np
+    import pandas as pd
 
-    test_start_ts = pd.Timestamp(context.test_start, tz="UTC")
-    eval_start = test_start_ts - context.bar_delta
+    from market_pipeline.backtest.engine import run_backtest
+    from market_pipeline.backtest.metrics import compute_metrics
+    from market_pipeline.strategy.ema_macd_atr_pullback import prepare_features_and_signals
+
+    per_sim = []
 
     for sim_idx in range(simulations):
-        sim_seed = seed + sim_idx
-        mc_candles = generate_synthetic_test_candles(context, seed=sim_seed)
+        synth_df = generate_synthetic_test_candles(
+            context,
+            seed=seed + sim_idx,
+        )
 
-        df_feat = prepare_features_and_signals(mc_candles, strategy_params)
-        df_eval = df_feat[df_feat["ts_utc"] >= eval_start].copy()
-
-        if df_eval.empty:
-            continue
+        feat = prepare_features_and_signals(synth_df, strategy_params)
+        test_start_ts = pd.Timestamp(context.test_start, tz="UTC")
+        eval_df = feat[feat["ts_utc"] >= test_start_ts].copy()
 
         result = run_backtest(
-            df_eval,
+            eval_df,
             atr_col=f"atr_{strategy_params.atr_period}",
             sl_atr_mult=strategy_params.atr_sl_mult,
             tp_atr_mult=strategy_params.atr_tp_mult,
@@ -360,43 +370,62 @@ def evaluate_fold_monte_carlo(
             exec_params=exec_params,
             trailing=trailing,
         )
-        m = compute_metrics(result)
+        metrics = compute_metrics(result)
 
-        metrics_rows.append(
+        per_sim.append(
             {
-                "trades": m.trades,
-                "total_return_pct": m.total_return_pct,
-                "max_drawdown_pct": m.max_drawdown_pct,
-                "sharpe": m.sharpe,
-                "winrate_pct": m.winrate_pct,
-                "profit_factor": m.profit_factor,
+                "simulation_index": sim_idx + 1,
+                "total_return_pct": float(metrics.total_return_pct),
+                "max_drawdown_pct": float(metrics.max_drawdown_pct),
+                "profit_factor": float(metrics.profit_factor),
+                "trades": int(metrics.trades),
+                "winrate_pct": float(metrics.winrate_pct),
+                "sharpe": float(metrics.sharpe),
             }
         )
 
-    if not metrics_rows:
-        return {
+    if not per_sim:
+        out = {
             "simulations": simulations,
             "successful_simulations": 0,
-            "median_return_pct": -999.0,
-            "q05_return_pct": -999.0,
-            "median_max_drawdown_pct": -999.0,
+            "median_return_pct": 0.0,
+            "q05_return_pct": 0.0,
+            "median_max_drawdown_pct": 0.0,
             "prob_loss": 1.0,
             "prob_pf_gt_1": 0.0,
             "median_trades": 0.0,
-            "score": -1e9,
+            "score": -999.0,
         }
+        if return_details:
+            out["details"] = []
+        return out
 
-    dfm = pd.DataFrame(metrics_rows)
+    df = pd.DataFrame(per_sim)
 
-    summary = {
+    median_return = float(df["total_return_pct"].median())
+    q05_return = float(df["total_return_pct"].quantile(0.05))
+    median_dd = float(df["max_drawdown_pct"].median())
+    prob_loss = float((df["total_return_pct"] < 0).mean())
+    prob_pf_gt_1 = float((df["profit_factor"] > 1.0).mean())
+    median_trades = float(df["trades"].median())
+
+    robust_ret = 0.55 * median_return + 0.45 * q05_return
+    dd_abs = abs(median_dd) if abs(median_dd) > 1e-9 else 1e-9
+    score = robust_ret / dd_abs + 0.75 * (prob_pf_gt_1 - 0.5) - 1.0 * prob_loss - (0.30 if median_trades < 10 else 0.0)
+
+    out = {
         "simulations": simulations,
-        "successful_simulations": int(len(dfm)),
-        "median_return_pct": float(dfm["total_return_pct"].median()),
-        "q05_return_pct": float(dfm["total_return_pct"].quantile(0.05)),
-        "median_max_drawdown_pct": float(dfm["max_drawdown_pct"].median()),
-        "prob_loss": float((dfm["total_return_pct"] < 0.0).mean()),
-        "prob_pf_gt_1": float((dfm["profit_factor"] > 1.0).mean()),
-        "median_trades": float(dfm["trades"].median()),
+        "successful_simulations": int(len(df)),
+        "median_return_pct": median_return,
+        "q05_return_pct": q05_return,
+        "median_max_drawdown_pct": median_dd,
+        "prob_loss": prob_loss,
+        "prob_pf_gt_1": prob_pf_gt_1,
+        "median_trades": median_trades,
+        "score": float(score),
     }
-    summary["score"] = float(mc_summary_to_score(summary))
-    return summary
+
+    if return_details:
+        out["details"] = per_sim
+
+    return out
