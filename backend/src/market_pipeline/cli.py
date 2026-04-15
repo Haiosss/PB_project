@@ -46,15 +46,11 @@ from market_pipeline.backtest.metrics import compute_metrics
 from pathlib import Path
 from market_pipeline.optimize.optuna_runner import run_optuna, save_optuna_result
 
-from market_pipeline.optimize.optuna_walkforward import run_optuna_walkforward, save_walkforward_result
-
 from market_pipeline.optimize.splits import walkforward_splits
 from market_pipeline.montecarlo.garch_fold_mc import build_garch_fold_context, generate_synthetic_test_candles
 from market_pipeline.montecarlo.validation import save_real_vs_synthetic_validation
 
 from pathlib import Path
-from market_pipeline.optimize.development_region import discover_parameter_region, save_development_region
-from market_pipeline.optimize.final_holdout_region import evaluate_region_on_holdout, save_holdout_region_result
 
 from market_pipeline.optimize.optuna_walkforward_pareto import (
     run_optuna_walkforward_pareto,

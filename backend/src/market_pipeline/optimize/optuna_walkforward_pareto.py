@@ -14,11 +14,66 @@ from market_pipeline.backtest.engine import ExecutionParams, TrailingParams, run
 from market_pipeline.backtest.metrics import compute_metrics
 from market_pipeline.marketdata.cleaning import clean_candles_df
 from market_pipeline.montecarlo.garch_fold_mc import build_garch_fold_context, evaluate_fold_monte_carlo
-from market_pipeline.optimize.region_selection import repair_params
 from market_pipeline.optimize.scoring import historical_validation_score, mc_validation_score, train_objective_score
 from market_pipeline.optimize.splits import Fold, walkforward_splits
 from market_pipeline.strategy.ema_macd_atr_pullback import StrategyParams, prepare_features_and_signals
 
+PARAM_SPECS = {
+    "ema_fast": ("int", 5, 80),
+    "ema_trend": ("int", 80, 300),
+    "rsi_period": ("int", 7, 21),
+    "rsi_long_max": ("float", 55.0, 85.0),
+    "rsi_short_min": ("float", 15.0, 45.0),
+    "atr_period": ("int", 7, 28),
+    "atr_sl_mult": ("float", 1.0, 4.0),
+    "atr_tp_mult": ("float", 1.0, 8.0),
+    "macd_fast": ("int", 6, 16),
+    "macd_slow": ("int", 18, 40),
+    "macd_signal": ("int", 5, 15),
+    "macd_hist_threshold": ("float", 0.0, 0.0002),
+    "cooldown_bars": ("int", 0, 20),
+    "trailing": ("bool", None, None),
+    "atr_trail_start_mult": ("float", 0.5, 3.0),
+    "atr_trail_mult": ("float", 0.8, 4.0),
+}
+
+
+def repair_params(params: dict) -> dict:
+    p = dict(params)
+
+    for name, spec in PARAM_SPECS.items():
+        typ, lo, hi = spec
+        if name not in p:
+            continue
+
+        if typ == "int":
+            p[name] = int(round(float(p[name])))
+            p[name] = max(int(lo), min(int(hi), p[name]))
+        elif typ == "float":
+            p[name] = float(p[name])
+            p[name] = max(float(lo), min(float(hi), p[name]))
+        elif typ == "bool":
+            p[name] = bool(p[name])
+
+    if p["ema_fast"] >= p["ema_trend"]:
+        p["ema_fast"] = max(5, min(p["ema_trend"] - 1, p["ema_fast"]))
+
+    if p["rsi_short_min"] >= p["rsi_long_max"]:
+        mid = 0.5 * (p["rsi_short_min"] + p["rsi_long_max"])
+        p["rsi_short_min"] = max(15.0, min(mid - 1.0, 44.0))
+        p["rsi_long_max"] = min(85.0, max(mid + 1.0, 56.0))
+
+    if p["macd_fast"] >= p["macd_slow"]:
+        p["macd_fast"] = max(6, min(p["macd_slow"] - 1, p["macd_fast"]))
+
+    if p["atr_tp_mult"] < p["atr_sl_mult"] * 0.8:
+        p["atr_tp_mult"] = min(8.0, max(p["atr_sl_mult"] * 0.8, p["atr_tp_mult"]))
+
+    if not p.get("trailing", False):
+        p["atr_trail_start_mult"] = 1.5
+        p["atr_trail_mult"] = 2.0
+
+    return p
 
 @dataclass(frozen=True)
 class PreparedFold:
